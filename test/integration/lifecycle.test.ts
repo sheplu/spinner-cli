@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Spinner, SpinnerGroup } from '../../src/spinner.js';
+import { Spinner, SpinnerGroup, __activeAnimationCount } from '../../src/spinner.js';
 import { createMockStream, stripAnsi, ANSI } from '../helpers/mock-stream.js';
 
 describe('Spinner Lifecycle', () => {
@@ -229,5 +229,200 @@ describe('Progress Feature Lifecycle', () => {
 
     spinner.stop();
     vi.useRealTimers();
+  });
+});
+
+describe('Resource management', () => {
+  let sigintBefore: number;
+  let exitBefore: number;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    sigintBefore = process.listenerCount('SIGINT');
+    exitBefore = process.listenerCount('exit');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    // The shared registry installs at most one handler of each kind, ever.
+    expect(process.listenerCount('SIGINT')).toBeLessThanOrEqual(sigintBefore + 1);
+    expect(process.listenerCount('exit')).toBeLessThanOrEqual(exitBefore + 1);
+  });
+
+  describe('process listeners (#1)', () => {
+    it('adds at most one SIGINT and one exit listener for many spinners', () => {
+      const spinners = Array.from({ length: 15 }, () =>
+        new Spinner({ stream: createMockStream(), ci: false }).start()
+      );
+
+      expect(process.listenerCount('SIGINT')).toBeLessThanOrEqual(sigintBefore + 1);
+      expect(process.listenerCount('exit')).toBeLessThanOrEqual(exitBefore + 1);
+
+      spinners.forEach(s => s.stop());
+    });
+
+    it('releases registry entries on stop()', () => {
+      const base = __activeAnimationCount();
+      const spinners = Array.from({ length: 5 }, () =>
+        new Spinner({ stream: createMockStream(), ci: false }).start()
+      );
+      expect(__activeAnimationCount()).toBe(base + 5);
+
+      spinners.forEach(s => s.stop());
+      expect(__activeAnimationCount()).toBe(base);
+    });
+
+    it('releases registry entries on clear()', () => {
+      const base = __activeAnimationCount();
+      const spinner = new Spinner({ stream: createMockStream(), ci: false }).start();
+      expect(__activeAnimationCount()).toBe(base + 1);
+
+      spinner.clear();
+      expect(__activeAnimationCount()).toBe(base);
+    });
+  });
+
+  describe('timer.unref (#2)', () => {
+    it('unrefs the animation interval so it cannot block process exit', () => {
+      const unref = vi.fn();
+      const realSetInterval = globalThis.setInterval;
+      // @ts-expect-error - minimal stub
+      vi.spyOn(globalThis, 'setInterval').mockImplementation((fn, ms) => {
+        const t = realSetInterval(fn as () => void, ms as number) as any;
+        t.unref = unref;
+        return t;
+      });
+
+      const spinner = new Spinner({ stream: createMockStream(), ci: false }).start();
+      expect(unref).toHaveBeenCalled();
+
+      spinner.stop();
+      vi.restoreAllMocks();
+    });
+  });
+
+  describe('Spinner._onProcessExit (#3)', () => {
+    it('restores the cursor and clears the timer', () => {
+      const stream = createMockStream();
+      const spinner = new Spinner({ stream, ci: false });
+      spinner.start('Working');
+      stream.clear();
+
+      spinner._onProcessExit();
+      expect(stream.output).toContain(ANSI.SHOW_CURSOR);
+      expect(spinner.isSpinning).toBe(false);
+
+      // Timer was cleared: advancing produces no further frames.
+      stream.clear();
+      vi.advanceTimersByTime(1000);
+      expect(stream.output).toBe('');
+    });
+
+    it('is idempotent', () => {
+      const stream = createMockStream();
+      const spinner = new Spinner({ stream, ci: false });
+      spinner.start('Working');
+
+      spinner._onProcessExit();
+      stream.clear();
+      spinner._onProcessExit();
+      // Second call does nothing (already stopped).
+      expect(stream.output).toBe('');
+    });
+  });
+
+  describe('SpinnerGroup._onProcessExit (#4)', () => {
+    it('restores the cursor and clears the timer', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('task', 'Working');
+      stream.clear();
+
+      group._onProcessExit();
+      expect(stream.output).toContain(ANSI.SHOW_CURSOR);
+
+      // Timer cleared: no further renders.
+      stream.clear();
+      vi.advanceTimersByTime(1000);
+      expect(stream.output).toBe('');
+    });
+
+    it('does not write SHOW_CURSOR twice', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('task', 'Working');
+
+      group._onProcessExit();
+      stream.clear();
+      group._onProcessExit();
+      expect(stream.output).not.toContain(ANSI.SHOW_CURSOR);
+    });
+  });
+});
+
+describe('SIGINT handling (#3)', () => {
+  // These tests emit a real SIGINT to exercise the shared handler, so they
+  // manage timers/exit manually rather than via the registry guard above.
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(((): never => {
+      return undefined as never;
+    }) as never);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('restores cursor and terminates when sole SIGINT listener', () => {
+    const stream = createMockStream();
+    const spinner = new Spinner({ stream, ci: false });
+    spinner.start('Working');
+    stream.clear();
+
+    process.emit('SIGINT');
+
+    expect(stream.output).toContain(ANSI.SHOW_CURSOR);
+    expect(spinner.isSpinning).toBe(false);
+    expect(exitSpy).toHaveBeenCalledWith(130);
+
+    spinner.stop();
+  });
+
+  it('cleans up registered animations on process "exit"', () => {
+    const stream = createMockStream();
+    const spinner = new Spinner({ stream, ci: false });
+    spinner.start('Working');
+    stream.clear();
+
+    // The shared 'exit' handler restores cursors for all live animations.
+    process.emit('exit', 0);
+
+    expect(stream.output).toContain(ANSI.SHOW_CURSOR);
+    expect(spinner.isSpinning).toBe(false);
+
+    spinner.stop();
+  });
+
+  it('cleans up but does NOT force exit when a co-listener exists', () => {
+    const coListener = vi.fn();
+    process.on('SIGINT', coListener);
+
+    const stream = createMockStream();
+    const spinner = new Spinner({ stream, ci: false });
+    spinner.start('Working');
+    stream.clear();
+
+    process.emit('SIGINT');
+
+    expect(stream.output).toContain(ANSI.SHOW_CURSOR); // still cleaned up
+    expect(exitSpy).not.toHaveBeenCalled(); // yielded to the consumer
+    expect(coListener).toHaveBeenCalled();
+
+    process.off('SIGINT', coListener);
+    spinner.stop();
   });
 });

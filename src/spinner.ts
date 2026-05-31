@@ -12,6 +12,60 @@ const CLEAR_LINE = '\r\x1B[K';
 const RESET = '\x1B[0m';
 
 /**
+ * Something that holds a live timer / hidden cursor and must be cleaned up if
+ * the process is interrupted or exits. Implemented by Spinner and SpinnerGroup.
+ * @internal
+ */
+interface Cleanable {
+  /** Restore the cursor and clear the animation timer. Must be idempotent. */
+  _onProcessExit(): void;
+}
+
+/**
+ * Shared registry of running animations. We attach exactly one `SIGINT` and one
+ * `exit` handler to `process` for the whole module (regardless of how many
+ * spinners exist), rather than one pair per instance — this avoids
+ * `MaxListenersExceededWarning` and the associated leak.
+ * @internal
+ */
+const activeAnimations = new Set<Cleanable>();
+let handlersInstalled = false;
+
+function onProcessExit(): void {
+  for (const a of activeAnimations) a._onProcessExit();
+}
+
+function onSigint(): void {
+  for (const a of activeAnimations) a._onProcessExit();
+  activeAnimations.clear();
+  // Attaching a SIGINT listener overrides Node's default terminate-on-Ctrl-C.
+  // Re-raise that default ONLY when we're the sole listener; if the consumer
+  // registered their own SIGINT handler, clean up and yield to it.
+  if (process.listenerCount('SIGINT') <= 1) {
+    process.exit(130);
+  }
+}
+
+function registerAnimation(a: Cleanable): void {
+  activeAnimations.add(a);
+  if (!handlersInstalled) {
+    handlersInstalled = true;
+    process.on('exit', onProcessExit);
+    process.on('SIGINT', onSigint);
+  }
+}
+
+function unregisterAnimation(a: Cleanable): void {
+  activeAnimations.delete(a);
+  // Handlers stay installed; they are cheap no-ops when the set is empty.
+}
+
+/** @internal Test-only: number of animations currently registered. */
+export function __activeAnimationCount(): number {
+  return activeAnimations.size;
+}
+
+/**
  * Detects if the current environment is a CI (Continuous Integration) system.
  * Checks for common CI environment variables from GitHub Actions, GitLab CI,
  * CircleCI, Travis CI, Jenkins, Buildkite, and Azure Pipelines.
@@ -239,7 +293,7 @@ export interface PromiseOptions {
  *   failText: 'Failed!'
  * });
  */
-export class Spinner {
+export class Spinner implements Cleanable {
   private frames: readonly string[];
   private interval: number;
   private text: string;
@@ -299,9 +353,6 @@ export class Spinner {
     this.startTime = null;
     this.progressValue = null;
     this.progressTotal = null;
-
-    // Bind cleanup handler
-    this._cleanup = this._cleanup.bind(this);
   }
 
   /**
@@ -410,8 +461,17 @@ export class Spinner {
     this.currentFrame = (this.currentFrame + 1) % this.frames.length;
   }
 
-  private _cleanup(): void {
+  /**
+   * Cleanup invoked by the shared process `SIGINT`/`exit` handler. Clears the
+   * animation timer and restores the cursor. Idempotent.
+   * @internal
+   */
+  _onProcessExit(): void {
     if (this._isSpinning) {
+      if (this.timer) {
+        clearInterval(this.timer);
+        this.timer = null;
+      }
       if (!this.ciMode && this.shouldHideCursor) {
         this.stream.write(SHOW_CURSOR);
       }
@@ -441,16 +501,17 @@ export class Spinner {
       return this;
     }
 
-    // Hide cursor and set up cleanup handlers
+    // Hide cursor and join the shared cleanup registry
     if (this.shouldHideCursor) {
       this.stream.write(HIDE_CURSOR);
     }
-    process.on('SIGINT', this._cleanup);
-    process.on('exit', this._cleanup);
+    registerAnimation(this);
 
-    // Start animation loop
+    // Start animation loop. unref() so a forgotten spinner never keeps the
+    // event loop alive and blocks process exit.
     this._render();
     this.timer = setInterval(() => this._render(), this.interval);
+    this.timer.unref?.();
 
     return this;
   }
@@ -484,9 +545,8 @@ export class Spinner {
       return this;
     }
 
-    // Remove cleanup handlers
-    process.off('SIGINT', this._cleanup);
-    process.off('exit', this._cleanup);
+    // Leave the shared cleanup registry
+    unregisterAnimation(this);
 
     // Clear line (unless persist mode) and show final text if provided
     if (!this.persist) {
@@ -527,8 +587,7 @@ export class Spinner {
     this.progressTotal = null;
 
     if (!this.ciMode) {
-      process.off('SIGINT', this._cleanup);
-      process.off('exit', this._cleanup);
+      unregisterAnimation(this);
       this.stream.write(CLEAR_LINE);
       if (this.shouldHideCursor) {
         this.stream.write(SHOW_CURSOR);
@@ -688,7 +747,6 @@ const MOVE_DOWN = (n: number) => `\x1B[${n}B`;
  * @internal
  */
 interface GroupSpinnerState {
-  spinner: Spinner;
   text: string;
   status: 'spinning' | 'succeeded' | 'failed' | 'warned' | 'info' | 'stopped';
   finalText?: string;
@@ -733,7 +791,7 @@ export interface SpinnerGroupOptions {
  *   group.promise('task2', processData(), 'Processing')
  * ]);
  */
-export class SpinnerGroup {
+export class SpinnerGroup implements Cleanable {
   private spinners: Map<string, GroupSpinnerState> = new Map();
   private order: string[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -744,6 +802,7 @@ export class SpinnerGroup {
   private interval: number = 80;
   private symbols: Required<SpinnerSymbols>;
   private shouldHideCursor: boolean;
+  private cursorHidden: boolean = false;
 
   /**
    * Creates a new SpinnerGroup instance.
@@ -792,8 +851,20 @@ export class SpinnerGroup {
 
     if (this.shouldHideCursor) {
       this.stream.write(HIDE_CURSOR);
+      this.cursorHidden = true;
     }
+    registerAnimation(this);
     this.timer = setInterval(() => this._renderAll(), this.interval);
+    // unref() so an unfinished group never keeps the event loop alive.
+    this.timer.unref?.();
+  }
+
+  /** Restore the cursor exactly once if we hid it. */
+  private _restoreCursor(): void {
+    if (this.cursorHidden) {
+      this.stream.write(SHOW_CURSOR);
+      this.cursorHidden = false;
+    }
   }
 
   private _stopTimerIfDone(): void {
@@ -801,10 +872,22 @@ export class SpinnerGroup {
     if (allDone && this.timer) {
       clearInterval(this.timer);
       this.timer = null;
-      if (this.shouldHideCursor) {
-        this.stream.write(SHOW_CURSOR);
-      }
+      unregisterAnimation(this);
+      this._restoreCursor();
     }
+  }
+
+  /**
+   * Cleanup invoked by the shared process `SIGINT`/`exit` handler. Clears the
+   * render timer and restores the cursor. Idempotent.
+   * @internal
+   */
+  _onProcessExit(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this._restoreCursor();
   }
 
   /**
@@ -818,9 +901,7 @@ export class SpinnerGroup {
   add(key: string, text: string): this {
     if (this.spinners.has(key)) return this;
 
-    // Create a dummy spinner (we manage rendering ourselves)
-    const spinner = new Spinner({ ci: true }); // Prevent it from rendering
-    this.spinners.set(key, { spinner, text, status: 'spinning' });
+    this.spinners.set(key, { text, status: 'spinning' });
     this.order.push(key);
 
     if (this.ciMode) {
