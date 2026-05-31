@@ -270,6 +270,9 @@ export class Spinner {
   constructor(options: SpinnerOptions = {}) {
     this.stream = options.stream ?? process.stderr;
     this.frames = options.frames ?? BRAILLE_FRAMES;
+    if (this.frames.length === 0) {
+      throw new Error('Spinner: `frames` must contain at least one frame');
+    }
     this.interval = options.interval ?? 80;
     this.text = options.text ?? '';
     this.color = options.color;
@@ -318,8 +321,10 @@ export class Spinner {
     if (ms < 1000) return `${ms}ms`;
     const seconds = ms / 1000;
     if (seconds < 60) return `${seconds.toFixed(1)}s`;
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = (seconds % 60).toFixed(0);
+    // Round to whole seconds first, then split, so we never render "1m 60s".
+    const totalSeconds = Math.round(seconds);
+    const minutes = Math.floor(totalSeconds / 60);
+    const remainingSeconds = totalSeconds % 60;
     return `${minutes}m ${remainingSeconds}s`;
   }
 
@@ -331,10 +336,17 @@ export class Spinner {
 
   private _getProgressText(): string {
     if (this.progressValue === null || this.progressTotal === null) return '';
-    const percent = Math.round((this.progressValue / this.progressTotal) * 100);
+    // Clamp the ratio to [0, 1] so out-of-range or zero totals can never produce
+    // NaN/Infinity/negative counts and crash repeat() inside the render loop.
+    const ratio = this.progressTotal > 0 ? this.progressValue / this.progressTotal : 0;
+    const clamped = Math.min(1, Math.max(0, ratio));
+    const percent = Math.round(clamped * 100);
 
     if (this.progressBar) {
-      const filled = Math.round((this.progressValue / this.progressTotal) * this.progressBarWidth);
+      const filled = Math.min(
+        this.progressBarWidth,
+        Math.max(0, Math.round(clamped * this.progressBarWidth))
+      );
       const empty = this.progressBarWidth - filled;
       const bar = '█'.repeat(filled) + '░'.repeat(empty);
       return ` ${this._colorize(`[${bar}]`, 'cyan')} ${percent}%`;
@@ -347,10 +359,23 @@ export class Spinner {
     return this.stream.columns ?? 80;
   }
 
+  /**
+   * Counts display width in code points rather than UTF-16 code units, so
+   * astral characters (e.g. emoji) count as one and are never split mid-pair.
+   * Note: this does not yet account for full-width (CJK/emoji) cells occupying
+   * two columns — that refinement is tracked as a follow-up.
+   */
+  private _displayWidth(text: string): number {
+    let width = 0;
+    for (const _ of text) width++;
+    return width;
+  }
+
   private _truncateText(text: string, maxLength: number): string {
-    if (!this.truncate || text.length <= maxLength) return text;
+    const chars = [...text];
+    if (!this.truncate || chars.length <= maxLength) return text;
     if (maxLength <= 3) return '...'.slice(0, maxLength);
-    return text.slice(0, maxLength - 3) + '...';
+    return chars.slice(0, maxLength - 3).join('') + '...';
   }
 
   private _render(): void {
@@ -365,12 +390,13 @@ export class Spinner {
       : `${this.prefix}${frame}`;
 
     if (this.truncate) {
-      // Calculate visible length (without ANSI codes)
-      const visibleLength = output.replace(/\x1B\[[0-9;]*m/g, '').length;
+      // Calculate visible length (without ANSI codes), measured in code points
+      // so multi-byte characters are counted and split correctly.
+      const visibleLength = this._displayWidth(output.replace(/\x1B\[[0-9;]*m/g, ''));
       const maxWidth = this._getTerminalWidth() - 1;
       if (visibleLength > maxWidth) {
         // Truncate the text part only
-        const overhead = visibleLength - (this.text?.length ?? 0);
+        const overhead = visibleLength - this._displayWidth(this.text ?? '');
         const maxTextLength = Math.max(0, maxWidth - overhead);
         const truncatedText = this._truncateText(this.text, maxTextLength);
         const coloredTruncated = truncatedText ? this._colorize(truncatedText, this.textColor) : '';
