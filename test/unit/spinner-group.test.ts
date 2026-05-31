@@ -372,4 +372,74 @@ describe('SpinnerGroup', () => {
       vi.useRealTimers();
     });
   });
+
+  describe('escape injection hardening (F1)', () => {
+    const EVIL = '\x1B[2Jboom\x1B]0;pwned\x07\r';
+
+    // Assert on bytes the library never emits itself (BEL, OSC, screen-clear),
+    // so we don't collide with its own SGR / cursor codes in TTY mode.
+    function assertClean(output: string): void {
+      expect(output).not.toContain('\x07'); // BEL
+      expect(output).not.toContain('\x1B]'); // OSC
+      expect(output).not.toContain('\x1B[2J'); // screen clear
+    }
+
+    it('sanitizes add() and update() text', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('t', EVIL);
+      group.update('t', EVIL);
+      vi.advanceTimersByTime(80);
+      assertClean(stream.output);
+      expect(stripAnsi(stream.output)).toContain('boom');
+      group.succeed('t');
+      vi.useRealTimers();
+    });
+
+    it('sanitizes log() messages', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: true });
+      group.add('t', 'task');
+      group.log(EVIL);
+      assertClean(stream.output);
+    });
+
+    it('sanitizes _finish() text (succeed)', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: true });
+      group.add('t', 'task');
+      group.succeed('t', EVIL);
+      assertClean(stream.output);
+      expect(stream.output).toContain('boom');
+    });
+
+    it('sanitizes custom symbols', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({
+        stream,
+        ci: true,
+        symbols: { succeed: '\x1B[2J✓' },
+      });
+      group.add('t', 'task');
+      group.succeed('t');
+      assertClean(stream.output);
+    });
+
+    it('does NOT strip the library\'s own colors (regression)', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('t', 'Working');
+      group.add('keep', 'Still going'); // keeps the render timer alive
+      // The colored cyan frame is emitted by the library on add().
+      expect(stream.output).toContain(ANSI.CYAN);
+      group.succeed('t', 'Done');
+      // Finished line is flushed on the next render tick.
+      vi.advanceTimersByTime(80);
+      expect(stripAnsi(stream.output)).toContain('Done');
+      group.succeed('keep');
+      vi.useRealTimers();
+    });
+  });
 });

@@ -3,8 +3,19 @@
   "version": "1.0.0",
   "description": "Native Node.js CLI spinner implementation",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sheplu/spinner-cli.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "main": "dist/spinner.js",
   "types": "dist/spinner.d.ts",
+  "files": [
+    "dist"
+  ],
   "exports": {
     ".": {
       "types": "./dist/spinner.d.ts",
@@ -16,7 +27,8 @@
     "example": "tsc && node dist/example.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
