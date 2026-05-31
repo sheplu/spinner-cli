@@ -367,6 +367,71 @@ describe('Spinner', () => {
 
       expect(result).toBe(spinner);
     });
+
+    it('does not throw and clamps when total is 0', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const spinner = new Spinner({ stream, ci: false, progressBar: true });
+      spinner.start('Downloading');
+      stream.clear();
+
+      spinner.progress(5, 0);
+      expect(() => vi.advanceTimersByTime(80)).not.toThrow();
+      // 0 total clamps to 0% with an empty bar
+      expect(stream.output).toContain('0%');
+      expect(stream.output).toContain('░');
+
+      spinner.stop();
+      vi.useRealTimers();
+    });
+
+    it('does not throw and clamps when value exceeds total', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const spinner = new Spinner({ stream, ci: false, progressBar: true });
+      spinner.start('Downloading');
+      stream.clear();
+
+      spinner.progress(150, 100);
+      expect(() => vi.advanceTimersByTime(80)).not.toThrow();
+      // Overshoot clamps to 100% with a full bar
+      expect(stream.output).toContain('100%');
+      expect(stream.output).toContain('█');
+
+      spinner.stop();
+      vi.useRealTimers();
+    });
+
+    it('does not throw and clamps negative values', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const spinner = new Spinner({ stream, ci: false, progressBar: true });
+      spinner.start('Downloading');
+      stream.clear();
+
+      spinner.progress(-5, 100);
+      expect(() => vi.advanceTimersByTime(80)).not.toThrow();
+      expect(stream.output).toContain('0%');
+
+      spinner.stop();
+      vi.useRealTimers();
+    });
+
+    it('does not throw for 0/0 progress', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const spinner = new Spinner({ stream, ci: false, progressBar: true });
+      spinner.start('Downloading');
+      stream.clear();
+
+      spinner.progress(0, 0);
+      expect(() => vi.advanceTimersByTime(80)).not.toThrow();
+      expect(stream.output).toContain('0%');
+      expect(stream.output).not.toContain('NaN');
+
+      spinner.stop();
+      vi.useRealTimers();
+    });
   });
 
   describe('log()', () => {
@@ -641,6 +706,110 @@ describe('Spinner', () => {
       vi.advanceTimersByTime(1500);
 
       expect(stream.output).toMatch(/\(.*s\)/);
+
+      spinner.stop();
+      vi.useRealTimers();
+    });
+
+    it('never renders "60s" at the minute boundary', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const spinner = new Spinner({
+        stream,
+        ci: false,
+        showTime: true,
+        text: 'Working',
+      });
+      spinner.start();
+      stream.clear();
+
+      // 119.52s (a multiple of the 80ms tick) previously rendered "1m 60s" on
+      // the final tick; it should now render "2m 0s".
+      vi.advanceTimersByTime(119520);
+
+      expect(stream.output).not.toMatch(/60s/);
+      expect(stream.output).toMatch(/2m 0s/);
+
+      spinner.stop();
+      vi.useRealTimers();
+    });
+  });
+
+  describe('frames validation', () => {
+    it('throws when frames is empty', () => {
+      const stream = createMockStream();
+      expect(() => new Spinner({ stream, frames: [] })).toThrow();
+    });
+  });
+
+  describe('truncate with multi-byte text', () => {
+    it('does not split surrogate pairs and ends with ellipsis', () => {
+      vi.useFakeTimers();
+      // columns:11 forces an ODD UTF-16 cut point (5), which a code-unit slice
+      // would split mid-pair into a lone surrogate; code-point slicing must not.
+      const stream = createMockStream({ columns: 11 });
+      const spinner = new Spinner({
+        stream,
+        ci: false,
+        truncate: true,
+        text: '🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀',
+      });
+      spinner.start();
+
+      const visible = stripAnsi(stream.output);
+      // A UTF-16 slice would leave a LONE surrogate at the cut point. Spreading
+      // into code points makes a lone surrogate its own 1-unit element, while a
+      // valid pair (🚀) is a single 2-unit element — so any 1-unit char in the
+      // surrogate range D800–DFFF means a pair was split.
+      const hasLoneSurrogate = [...visible].some(
+        ch => ch.length === 1 && ch.charCodeAt(0) >= 0xd800 && ch.charCodeAt(0) <= 0xdfff
+      );
+      expect(hasLoneSurrogate).toBe(false);
+      expect(visible).toContain('...');
+      // Some rockets survive, and each is intact.
+      const rockets = [...visible].filter(ch => ch === '🚀');
+      expect(rockets.length).toBeGreaterThan(0);
+
+      spinner.stop();
+      vi.useRealTimers();
+    });
+
+    it('clips the ellipsis itself when room is tiny (maxLength <= 3)', () => {
+      vi.useFakeTimers();
+      // columns:5 → maxWidth 4, overhead 2 (frame+space) → maxTextLength 2.
+      const stream = createMockStream({ columns: 5 });
+      const spinner = new Spinner({
+        stream,
+        ci: false,
+        truncate: true,
+        text: 'abcdefghij',
+      });
+      spinner.start();
+
+      const visible = stripAnsi(stream.output);
+      expect(visible.length).toBeLessThanOrEqual(5);
+      // Only a clipped ellipsis fits, never any of the original text.
+      expect(visible).not.toMatch(/[a-j]/);
+
+      spinner.stop();
+      vi.useRealTimers();
+    });
+
+    it('renders frame only when no room for any text', () => {
+      vi.useFakeTimers();
+      // columns:3 → maxTextLength 0 → truncated text is empty → frame only.
+      const stream = createMockStream({ columns: 3 });
+      const spinner = new Spinner({
+        stream,
+        ci: false,
+        truncate: true,
+        text: 'abcdefghij',
+      });
+      spinner.start();
+
+      const visible = stripAnsi(stream.output);
+      expect(visible).not.toMatch(/[a-j]/);
+      expect(visible).not.toContain('...');
 
       spinner.stop();
       vi.useRealTimers();
