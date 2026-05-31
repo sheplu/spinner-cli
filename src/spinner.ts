@@ -12,6 +12,21 @@ const CLEAR_LINE = '\r\x1B[K';
 const RESET = '\x1B[0m';
 
 /**
+ * Minimal structural type for the output target. Covers every member this
+ * library touches, so consumers (and tests) can pass any writable-like object
+ * without satisfying Node's full `WriteStream` interface. `process.stderr` and
+ * `process.stdout` both structurally satisfy it.
+ */
+export interface WritableStreamLike {
+  /** Writes a chunk; return value is ignored by this library. */
+  write(chunk: string): boolean;
+  /** Whether the stream is a terminal. Absent/false disables animation. */
+  isTTY?: boolean;
+  /** Terminal width in columns, used for truncation. */
+  columns?: number;
+}
+
+/**
  * Matches all C0 control characters (0x00–0x1F), DEL (0x7F), and the 8-bit CSI
  * introducer (0x9B). This covers ESC (0x1B) — the lead byte of every ANSI
  * escape / OSC sequence — as well as BEL (0x07), CR (0x0D), and backspace.
@@ -127,7 +142,7 @@ export function isCI(): boolean {
  *   console.log('Terminal supports colors');
  * }
  */
-export function isTTY(stream: NodeJS.WriteStream = process.stderr): boolean {
+export function isTTY(stream: WritableStreamLike = process.stderr): boolean {
   return stream.isTTY ?? false;
 }
 
@@ -164,6 +179,85 @@ export const colors = {
  * Corresponds to keys in the {@link colors} object.
  */
 export type Color = keyof typeof colors;
+
+// --- Shared rendering helpers (used by both Spinner and SpinnerGroup) ---
+
+/** Wraps `text` in an ANSI color, unless no color is given or in CI mode. */
+function colorize(text: string, color: Color | undefined, ciMode: boolean): string {
+  if (!color || ciMode) return text;
+  return `${colors[color]}${text}${RESET}`;
+}
+
+/** Formats an elapsed duration, e.g. `850ms`, `1.5s`, `2m 3s`. */
+function formatTime(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  // Round to whole seconds first, then split, so we never render "1m 60s".
+  const totalSeconds = Math.round(seconds);
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return `${minutes}m ${remainingSeconds}s`;
+}
+
+/**
+ * Counts display width in code points rather than UTF-16 code units, so astral
+ * characters (e.g. emoji) count as one and are never split mid-pair. Does not
+ * yet account for full-width (CJK/emoji) cells occupying two columns.
+ */
+function displayWidth(text: string): number {
+  let width = 0;
+  for (const _ of text) width++;
+  return width;
+}
+
+/** Truncates `text` to `maxLength` code points, appending `...`. */
+function truncateText(text: string, maxLength: number): string {
+  const chars = [...text];
+  if (chars.length <= maxLength) return text;
+  if (maxLength <= 3) return '...'.slice(0, maxLength);
+  return chars.slice(0, maxLength - 3).join('') + '...';
+}
+
+/**
+ * Renders the progress segment (leading-space-prefixed), either a percentage or
+ * a `[█░]` bar. The ratio is clamped to [0, 1] so out-of-range or zero totals
+ * never produce NaN/negative repeat counts.
+ */
+function renderProgress(
+  value: number,
+  total: number,
+  opts: { bar: boolean; width: number },
+  ciMode: boolean
+): string {
+  const ratio = total > 0 ? value / total : 0;
+  const clamped = Math.min(1, Math.max(0, ratio));
+  const percent = Math.round(clamped * 100);
+
+  if (opts.bar) {
+    const filled = Math.min(opts.width, Math.max(0, Math.round(clamped * opts.width)));
+    const empty = opts.width - filled;
+    const barStr = '█'.repeat(filled) + '░'.repeat(empty);
+    return ` ${colorize(`[${barStr}]`, 'cyan', ciMode)} ${percent}%`;
+  }
+
+  return ` ${colorize(`${percent}%`, 'cyan', ciMode)}`;
+}
+
+/** Resolves and sanitizes the status symbols, applying defaults. */
+function resolveSymbols(symbols?: SpinnerSymbols): Required<SpinnerSymbols> {
+  return {
+    succeed: stripControl(symbols?.succeed ?? '✔'),
+    fail: stripControl(symbols?.fail ?? '✖'),
+    warn: stripControl(symbols?.warn ?? '⚠'),
+    info: stripControl(symbols?.info ?? 'ℹ'),
+  };
+}
+
+/** Resolves CI mode: explicit option, else auto-detect from env / non-TTY. */
+function resolveCiMode(ci: boolean | undefined, stream: WritableStreamLike): boolean {
+  return ci ?? (isCI() || !isTTY(stream));
+}
 
 /**
  * Braille dot spinner frames (default). Smooth, modern appearance.
@@ -256,7 +350,7 @@ export interface SpinnerOptions {
   /** Show elapsed time next to spinner text. Default: false */
   showTime?: boolean;
   /** Output stream. Default: process.stderr */
-  stream?: NodeJS.WriteStream;
+  stream?: WritableStreamLike;
   /** Text prefix shown before spinner (e.g., "  " for indent or "[1/3] "). Default: '' */
   prefix?: string;
   /** Text suffix shown after main text. Default: '' */
@@ -332,7 +426,7 @@ export class Spinner implements Cleanable {
   private currentFrame: number;
   private _isSpinning: boolean;
   private timer: ReturnType<typeof setInterval> | null;
-  private stream: NodeJS.WriteStream;
+  private stream: WritableStreamLike;
   private startTime: number | null;
   private progressValue: number | null;
   private progressTotal: number | null;
@@ -365,16 +459,11 @@ export class Spinner implements Cleanable {
     this.color = options.color;
     this.textColor = options.textColor;
     // CI mode: explicit option, or auto-detect from CI env vars or non-TTY
-    this.ciMode = options.ci ?? (isCI() || !isTTY(this.stream));
+    this.ciMode = resolveCiMode(options.ci, this.stream);
     this.showTime = options.showTime ?? false;
     this.prefix = stripControl(options.prefix ?? '');
     this.suffix = stripControl(options.suffix ?? '');
-    this.symbols = {
-      succeed: stripControl(options.symbols?.succeed ?? '✔'),
-      fail: stripControl(options.symbols?.fail ?? '✖'),
-      warn: stripControl(options.symbols?.warn ?? '⚠'),
-      info: stripControl(options.symbols?.info ?? 'ℹ'),
-    };
+    this.symbols = resolveSymbols(options.symbols);
     this.persist = options.persist ?? false;
     this.shouldHideCursor = options.hideCursor ?? true;
     this.progressBar = options.progressBar ?? false;
@@ -399,70 +488,38 @@ export class Spinner implements Cleanable {
     return this._isSpinning;
   }
 
-  private _colorize(text: string, color?: Color): string {
-    if (!color || this.ciMode) return text;
-    return `${colors[color]}${text}${RESET}`;
+  /**
+   * Whether animation is enabled. `false` in CI / non-TTY environments, where
+   * the spinner prints static lines instead of animating. Distinct from
+   * {@link isSpinning}, which reflects whether `start()` is currently active.
+   * @returns `true` if animations are enabled, `false` in CI/non-TTY mode.
+   */
+  get isEnabled(): boolean {
+    return !this.ciMode;
   }
 
-  private _formatTime(ms: number): string {
-    if (ms < 1000) return `${ms}ms`;
-    const seconds = ms / 1000;
-    if (seconds < 60) return `${seconds.toFixed(1)}s`;
-    // Round to whole seconds first, then split, so we never render "1m 60s".
-    const totalSeconds = Math.round(seconds);
-    const minutes = Math.floor(totalSeconds / 60);
-    const remainingSeconds = totalSeconds % 60;
-    return `${minutes}m ${remainingSeconds}s`;
+  private _colorize(text: string, color?: Color): string {
+    return colorize(text, color, this.ciMode);
   }
 
   private _getElapsedText(): string {
     if (!this.showTime || !this.startTime) return '';
     const elapsed = Date.now() - this.startTime;
-    return ` ${this._colorize(`(${this._formatTime(elapsed)})`, 'gray')}`;
+    return ` ${this._colorize(`(${formatTime(elapsed)})`, 'gray')}`;
   }
 
   private _getProgressText(): string {
     if (this.progressValue === null || this.progressTotal === null) return '';
-    // Clamp the ratio to [0, 1] so out-of-range or zero totals can never produce
-    // NaN/Infinity/negative counts and crash repeat() inside the render loop.
-    const ratio = this.progressTotal > 0 ? this.progressValue / this.progressTotal : 0;
-    const clamped = Math.min(1, Math.max(0, ratio));
-    const percent = Math.round(clamped * 100);
-
-    if (this.progressBar) {
-      const filled = Math.min(
-        this.progressBarWidth,
-        Math.max(0, Math.round(clamped * this.progressBarWidth))
-      );
-      const empty = this.progressBarWidth - filled;
-      const bar = '█'.repeat(filled) + '░'.repeat(empty);
-      return ` ${this._colorize(`[${bar}]`, 'cyan')} ${percent}%`;
-    }
-
-    return ` ${this._colorize(`${percent}%`, 'cyan')}`;
+    return renderProgress(
+      this.progressValue,
+      this.progressTotal,
+      { bar: this.progressBar, width: this.progressBarWidth },
+      this.ciMode
+    );
   }
 
   private _getTerminalWidth(): number {
     return this.stream.columns ?? 80;
-  }
-
-  /**
-   * Counts display width in code points rather than UTF-16 code units, so
-   * astral characters (e.g. emoji) count as one and are never split mid-pair.
-   * Note: this does not yet account for full-width (CJK/emoji) cells occupying
-   * two columns — that refinement is tracked as a follow-up.
-   */
-  private _displayWidth(text: string): number {
-    let width = 0;
-    for (const _ of text) width++;
-    return width;
-  }
-
-  private _truncateText(text: string, maxLength: number): string {
-    const chars = [...text];
-    if (!this.truncate || chars.length <= maxLength) return text;
-    if (maxLength <= 3) return '...'.slice(0, maxLength);
-    return chars.slice(0, maxLength - 3).join('') + '...';
   }
 
   private _render(): void {
@@ -479,13 +536,13 @@ export class Spinner implements Cleanable {
     if (this.truncate) {
       // Calculate visible length (without ANSI codes), measured in code points
       // so multi-byte characters are counted and split correctly.
-      const visibleLength = this._displayWidth(output.replace(/\x1B\[[0-9;]*m/g, ''));
+      const visibleLength = displayWidth(output.replace(/\x1B\[[0-9;]*m/g, ''));
       const maxWidth = this._getTerminalWidth() - 1;
       if (visibleLength > maxWidth) {
         // Truncate the text part only
-        const overhead = visibleLength - this._displayWidth(this.text ?? '');
+        const overhead = visibleLength - displayWidth(this.text ?? '');
         const maxTextLength = Math.max(0, maxWidth - overhead);
-        const truncatedText = this._truncateText(this.text, maxTextLength);
+        const truncatedText = truncateText(this.text, maxTextLength);
         const coloredTruncated = truncatedText ? this._colorize(truncatedText, this.textColor) : '';
         output = coloredTruncated
           ? `${this.prefix}${frame} ${coloredTruncated}${suffixText}${progressText}${timeText}`
@@ -795,17 +852,56 @@ const MOVE_UP = (n: number) => `\x1B[${n}A`;
 const MOVE_DOWN = (n: number) => `\x1B[${n}B`;
 
 /**
- * Internal state for a spinner within a SpinnerGroup.
+ * Internal state for a spinner within a SpinnerGroup. All per-entry options are
+ * resolved against the group defaults at `add()` time.
  * @internal
  */
 interface GroupSpinnerState {
   text: string;
   status: 'spinning' | 'succeeded' | 'failed' | 'warned' | 'info' | 'stopped';
   finalText?: string;
+  prefix: string;
+  suffix: string;
+  color: Color | undefined;
+  textColor: Color | undefined;
+  truncate: boolean;
+  progressBar: boolean;
+  progressBarWidth: number;
+  showTime: boolean;
+  startTime: number | null;
+  progressValue: number | null;
+  progressTotal: number | null;
 }
 
 /**
- * Configuration options for the SpinnerGroup class.
+ * Per-entry options for a spinner added to a {@link SpinnerGroup}. Each option
+ * overrides the corresponding group-wide default.
+ * @example
+ * group.add('build', 'Building', { prefix: '[1/3] ', color: 'green', showTime: true });
+ */
+export interface GroupEntryOptions {
+  /** Text prefix shown before the spinner frame. Default: '' */
+  prefix?: string;
+  /** Text suffix shown after the entry text. Default: '' */
+  suffix?: string;
+  /** Color of the spinner frame. Default: group `color` (or 'cyan'). */
+  color?: Color;
+  /** Color of the entry text. Default: undefined (no color). */
+  textColor?: Color;
+  /** Truncate the line to terminal width. Default: group `truncate` (true). */
+  truncate?: boolean;
+  /** Show progress as a visual bar instead of a percentage. Default: false */
+  progressBar?: boolean;
+  /** Width of the progress bar in characters. Default: group `progressBarWidth` (20). */
+  progressBarWidth?: number;
+  /** Show elapsed time next to the entry. Default: group `showTime` (false). */
+  showTime?: boolean;
+}
+
+/**
+ * Configuration options for the SpinnerGroup class. The `color`, `truncate`,
+ * `showTime`, and `progressBarWidth` fields set group-wide defaults that each
+ * entry inherits unless overridden via {@link GroupEntryOptions}.
  * @example
  * const group = new SpinnerGroup({
  *   symbols: { succeed: '✓', fail: '✗' }
@@ -815,11 +911,23 @@ export interface SpinnerGroupOptions {
   /** Disable colors and animations. Auto-detected from CI env vars and TTY if not set. */
   ci?: boolean;
   /** Output stream. Default: process.stderr */
-  stream?: NodeJS.WriteStream;
+  stream?: WritableStreamLike;
   /** Custom symbols for status methods. */
   symbols?: SpinnerSymbols;
   /** Hide/show cursor during spinning. Set to false for problematic terminals. Default: true */
   hideCursor?: boolean;
+  /** Default frame color for entries. Default: 'cyan' */
+  color?: Color;
+  /**
+   * Default truncation for entries. Default: **true** — group lines are
+   * truncated to the terminal width so each entry occupies exactly one row,
+   * which the multi-line render relies on. Disable per entry at your own risk.
+   */
+  truncate?: boolean;
+  /** Default `showTime` for entries. Default: false */
+  showTime?: boolean;
+  /** Default progress bar width for entries. Default: 20 */
+  progressBarWidth?: number;
 }
 
 /**
@@ -847,7 +955,7 @@ export class SpinnerGroup implements Cleanable {
   private spinners: Map<string, GroupSpinnerState> = new Map();
   private order: string[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
-  private stream: NodeJS.WriteStream;
+  private stream: WritableStreamLike;
   private ciMode: boolean;
   private frames: readonly string[] = BRAILLE_FRAMES;
   private currentFrame: number = 0;
@@ -855,6 +963,11 @@ export class SpinnerGroup implements Cleanable {
   private symbols: Required<SpinnerSymbols>;
   private shouldHideCursor: boolean;
   private cursorHidden: boolean = false;
+  // Group-wide defaults inherited by each entry unless overridden.
+  private defaultColor: Color;
+  private defaultTruncate: boolean;
+  private defaultShowTime: boolean;
+  private defaultProgressBarWidth: number;
 
   /**
    * Creates a new SpinnerGroup instance.
@@ -862,19 +975,91 @@ export class SpinnerGroup implements Cleanable {
    */
   constructor(options: SpinnerGroupOptions = {}) {
     this.stream = options.stream ?? process.stderr;
-    this.ciMode = options.ci ?? (isCI() || !isTTY(this.stream));
-    this.symbols = {
-      succeed: stripControl(options.symbols?.succeed ?? '✔'),
-      fail: stripControl(options.symbols?.fail ?? '✖'),
-      warn: stripControl(options.symbols?.warn ?? '⚠'),
-      info: stripControl(options.symbols?.info ?? 'ℹ'),
-    };
+    this.ciMode = resolveCiMode(options.ci, this.stream);
+    this.symbols = resolveSymbols(options.symbols);
     this.shouldHideCursor = options.hideCursor ?? true;
+    this.defaultColor = options.color ?? 'cyan';
+    this.defaultTruncate = options.truncate ?? true;
+    this.defaultShowTime = options.showTime ?? false;
+    this.defaultProgressBarWidth = options.progressBarWidth ?? 20;
+    if (!Number.isInteger(this.defaultProgressBarWidth) || this.defaultProgressBarWidth < 1) {
+      throw new Error('SpinnerGroup: `progressBarWidth` must be a positive integer');
+    }
   }
 
   private _colorize(text: string, color?: Color): string {
-    if (!color || this.ciMode) return text;
-    return `${colors[color]}${text}${RESET}`;
+    return colorize(text, color, this.ciMode);
+  }
+
+  /**
+   * Whether any spinner in the group is still running.
+   * @returns `true` if at least one entry has status `'spinning'`.
+   */
+  get isSpinning(): boolean {
+    for (const state of this.spinners.values()) {
+      if (state.status === 'spinning') return true;
+    }
+    return false;
+  }
+
+  /**
+   * The keys of all spinners in the group, in insertion order.
+   * @returns A copy of the ordered key list.
+   */
+  keys(): string[] {
+    return [...this.order];
+  }
+
+  /**
+   * The current status of a spinner, or `undefined` if the key is unknown.
+   * @param key - Key of the spinner to query.
+   * @returns The entry's status, or `undefined`.
+   */
+  status(key: string): GroupSpinnerState['status'] | undefined {
+    return this.spinners.get(key)?.status;
+  }
+
+  /** Elapsed-time segment for an entry, computed from a base timestamp. */
+  private _elapsedText(state: GroupSpinnerState, now: number): string {
+    if (!state.showTime || state.startTime === null) return '';
+    return ` ${this._colorize(`(${formatTime(now - state.startTime)})`, 'gray')}`;
+  }
+
+  /**
+   * Builds a single spinning entry's line from its resolved options, then
+   * truncates the text segment so the visible line is <= terminal width - 1.
+   * This guarantees one terminal row per entry, which the cursor math relies
+   * on. The `frame` is passed in so entries can share one animation frame.
+   */
+  private _composeLine(state: GroupSpinnerState, frame: string): string {
+    const progressText =
+      state.progressValue !== null && state.progressTotal !== null
+        ? renderProgress(
+            state.progressValue,
+            state.progressTotal,
+            { bar: state.progressBar, width: state.progressBarWidth },
+            this.ciMode
+          )
+        : '';
+    const timeText = this._elapsedText(state, Date.now());
+    const suffixText = state.suffix ? ` ${state.suffix}` : '';
+    const coloredText = state.text ? this._colorize(state.text, state.textColor) : '';
+
+    const build = (txt: string): string =>
+      `${state.prefix}${frame} ${txt}${suffixText}${progressText}${timeText}`;
+
+    let line = build(coloredText);
+    if (state.truncate) {
+      const visibleLength = displayWidth(line.replace(/\x1B\[[0-9;]*m/g, ''));
+      const maxWidth = (this.stream.columns ?? 80) - 1;
+      if (visibleLength > maxWidth) {
+        const overhead = visibleLength - displayWidth(state.text);
+        const maxTextLength = Math.max(0, maxWidth - overhead);
+        const truncated = truncateText(state.text, maxTextLength);
+        line = build(truncated ? this._colorize(truncated, state.textColor) : '');
+      }
+    }
+    return line;
   }
 
   private _renderAll(): void {
@@ -883,13 +1068,18 @@ export class SpinnerGroup implements Cleanable {
       this.stream.write(MOVE_UP(this.order.length - 1));
     }
 
+    const sharedFrame = this._colorize(this.frames[this.currentFrame], this.defaultColor);
     for (const key of this.order) {
       const state = this.spinners.get(key)!;
       this.stream.write(CLEAR_LINE);
 
       if (state.status === 'spinning') {
-        const frame = this._colorize(this.frames[this.currentFrame], 'cyan');
-        this.stream.write(`${frame} ${state.text}\n`);
+        // Recolor the frame only if this entry overrides the group default.
+        const frame =
+          state.color === this.defaultColor
+            ? sharedFrame
+            : this._colorize(this.frames[this.currentFrame], state.color);
+        this.stream.write(this._composeLine(state, frame) + '\n');
       } else {
         this.stream.write(`${state.finalText}\n`);
       }
@@ -946,23 +1136,44 @@ export class SpinnerGroup implements Cleanable {
    * Adds a new spinner to the group.
    * @param key - Unique identifier for the spinner.
    * @param text - Text to display next to the spinner.
+   * @param options - Optional per-entry options (prefix, color, progress, etc.).
    * @returns The group instance for chaining.
    * @example
    * group.add('download', 'Downloading files');
+   * group.add('build', 'Building', { prefix: '[1/2] ', showTime: true });
    */
-  add(key: string, text: string): this {
+  add(key: string, text: string, options: GroupEntryOptions = {}): this {
     if (this.spinners.has(key)) return this;
 
-    text = stripControl(text);
-    this.spinners.set(key, { text, status: 'spinning' });
+    const progressBarWidth = options.progressBarWidth ?? this.defaultProgressBarWidth;
+    if (!Number.isInteger(progressBarWidth) || progressBarWidth < 1) {
+      throw new Error('SpinnerGroup: `progressBarWidth` must be a positive integer');
+    }
+    const showTime = options.showTime ?? this.defaultShowTime;
+    const state: GroupSpinnerState = {
+      text: stripControl(text),
+      status: 'spinning',
+      prefix: stripControl(options.prefix ?? ''),
+      suffix: stripControl(options.suffix ?? ''),
+      color: options.color ?? this.defaultColor,
+      textColor: options.textColor,
+      truncate: options.truncate ?? this.defaultTruncate,
+      progressBar: options.progressBar ?? false,
+      progressBarWidth,
+      showTime,
+      startTime: showTime ? Date.now() : null,
+      progressValue: null,
+      progressTotal: null,
+    };
+    this.spinners.set(key, state);
     this.order.push(key);
 
     if (this.ciMode) {
-      this.stream.write(`- ${text}\n`);
+      this.stream.write(`${state.prefix}- ${state.text}\n`);
     } else {
-      // Write initial line
-      const frame = this._colorize(this.frames[this.currentFrame], 'cyan');
-      this.stream.write(`${frame} ${text}\n`);
+      // Write the initial line, composed/truncated like a normal render tick.
+      const frame = this._colorize(this.frames[this.currentFrame], state.color);
+      this.stream.write(this._composeLine(state, frame) + '\n');
       this._startTimer();
     }
 
@@ -981,6 +1192,25 @@ export class SpinnerGroup implements Cleanable {
     const state = this.spinners.get(key);
     if (state && state.status === 'spinning') {
       state.text = stripControl(text);
+    }
+    return this;
+  }
+
+  /**
+   * Sets the progress value for a running spinner. No-op if the key is unknown
+   * or already finished. Shows as a percentage or bar per the entry's options.
+   * @param key - Key of the spinner to update.
+   * @param value - Current progress value.
+   * @param total - Total value (100% when value equals total).
+   * @returns The group instance for chaining.
+   * @example
+   * group.progress('download', 50, 100); // 50%
+   */
+  progress(key: string, value: number, total: number): this {
+    const state = this.spinners.get(key);
+    if (state && state.status === 'spinning') {
+      state.progressValue = value;
+      state.progressTotal = total;
     }
     return this;
   }
@@ -1089,11 +1319,25 @@ export class SpinnerGroup implements Cleanable {
     state.status = status;
     // `text` is caller-supplied; `state.text` was sanitized on add/update.
     const displayText = text !== undefined ? stripControl(text) : state.text;
-    if (symbol) {
-      const coloredSymbol = this._colorize(symbol, color);
-      state.finalText = `${coloredSymbol} ${displayText}`;
-    } else {
-      state.finalText = displayText;
+    // Freeze elapsed time now so the done line doesn't keep ticking, and drop
+    // progress (mirrors Spinner, which clears progress on finalize).
+    const timeText = this._elapsedText(state, Date.now());
+    state.progressValue = null;
+    state.progressTotal = null;
+    state.startTime = null;
+
+    const coloredSymbol = symbol ? this._colorize(symbol, color) : '';
+    const lead = symbol ? `${state.prefix}${coloredSymbol} ` : state.prefix;
+    const build = (txt: string): string => `${lead}${txt}${timeText}`;
+
+    state.finalText = build(displayText);
+    if (state.truncate) {
+      const visibleLength = displayWidth(state.finalText.replace(/\x1B\[[0-9;]*m/g, ''));
+      const maxWidth = (this.stream.columns ?? 80) - 1;
+      if (visibleLength > maxWidth) {
+        const overhead = visibleLength - displayWidth(displayText);
+        state.finalText = build(truncateText(displayText, Math.max(0, maxWidth - overhead)));
+      }
     }
 
     if (this.ciMode) {
@@ -1153,4 +1397,17 @@ export class SpinnerGroup implements Cleanable {
 export function spin(text: string, options?: SpinnerOptions): Spinner {
   const spinner = new Spinner({ ...options, text });
   return spinner.start();
+}
+
+/**
+ * Factory function to create a SpinnerGroup, mirroring {@link spin}.
+ * Unlike `spin()`, the group does not auto-start — each spinner begins when
+ * you call {@link SpinnerGroup.add}.
+ * @example
+ * const group = spinGroup();
+ * group.add('build', 'Building...');
+ * group.succeed('build', 'Built');
+ */
+export function spinGroup(options?: SpinnerGroupOptions): SpinnerGroup {
+  return new SpinnerGroup(options);
 }

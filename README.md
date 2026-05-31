@@ -191,9 +191,9 @@ On success calls `succeed()`, on error calls `fail()` and re-throws.
 Run multiple spinners concurrently:
 
 ```typescript
-import { SpinnerGroup } from 'spinner-cli';
+import { SpinnerGroup, spinGroup } from 'spinner-cli';
 
-const group = new SpinnerGroup();
+const group = new SpinnerGroup();        // or: spinGroup()
 
 group.add('api', 'Fetching from API...');
 group.add('db', 'Querying database...');
@@ -205,18 +205,48 @@ group.succeed('api', 'API data received');
 group.fail('db', 'Database timeout');
 ```
 
+### Per-entry options
+
+Each `add()` accepts the same display options as a standalone `Spinner`:
+
+```typescript
+group.add('build', 'Building', {
+  prefix: '[1/3] ',     // step indicator
+  color: 'green',       // per-entry frame color (default: group color, 'cyan')
+  showTime: true,       // elapsed time, frozen when the entry finishes
+  progressBar: true,    // visual bar instead of a percentage
+});
+
+group.progress('build', 50, 100);  // update progress for an entry
+```
+
+Available per-entry options: `prefix`, `suffix`, `color`, `textColor`, `truncate`,
+`progressBar`, `progressBarWidth`, `showTime`. Group-wide defaults (`color`, `truncate`,
+`showTime`, `progressBarWidth`) can be set on the constructor and are inherited by entries.
+
+> **Truncation defaults ON for groups.** Each entry must occupy exactly one terminal row for
+> the multi-line render to stay aligned, so group lines are truncated to the terminal width.
+> You can disable it per entry (`{ truncate: false }`) if you manage widths yourself.
+>
+> **CI / non-TTY mode** prints one static line per entry; live progress and elapsed-time
+> updates are not re-rendered (the final line includes total elapsed time when `showTime` is on).
+
 ### SpinnerGroup Methods
 
 | Method | Description |
 |--------|-------------|
-| `add(key, text)` | Add a new spinner |
+| `add(key, text, options?)` | Add a new spinner (optional per-entry options) |
 | `update(key, text)` | Update spinner text |
+| `progress(key, value, total)` | Set an entry's progress |
 | `succeed(key, text?)` | Mark as successful |
 | `fail(key, text?)` | Mark as failed |
 | `warn(key, text?)` | Mark with warning |
 | `info(key, text?)` | Mark with info |
 | `log(message)` | Print message above spinners |
 | `promise(key, action, options?)` | Wrap async operation |
+
+State getters: `isSpinning` (any entry still running), `keys()` (ordered keys),
+`status(key)` (per-entry status or `undefined`).
 
 ## Prefix / Indent
 
@@ -251,11 +281,20 @@ const spinner = new Spinner({
 
 ## Stream Selection
 
-Output to stdout instead of stderr:
+Spinner output defaults to **stderr**, not stdout. This keeps stdout clean for your
+program's actual output, so a user can pipe real data (`mycli > out.json`) while the spinner
+still animates on the terminal. Note the flip side: redirecting stderr (`mycli 2>/dev/null`)
+hides the spinner.
+
+Switch to stdout (or any writable-like target) if you prefer:
 
 ```typescript
 const spinner = new Spinner({ stream: process.stdout });
 ```
+
+The `stream` option accepts any object matching `WritableStreamLike`
+(`{ write(s): boolean; isTTY?: boolean; columns?: number }`), not just Node's `WriteStream` —
+handy for tests and custom sinks.
 
 ## TTY Detection
 

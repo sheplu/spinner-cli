@@ -920,6 +920,18 @@ describe('escape injection hardening (F1)', () => {
   });
 });
 
+describe('isEnabled getter', () => {
+  it('is true in TTY mode', () => {
+    const stream = createMockStream({ isTTY: true });
+    expect(new Spinner({ stream, ci: false }).isEnabled).toBe(true);
+  });
+
+  it('is false in CI mode', () => {
+    const stream = createMockStream();
+    expect(new Spinner({ stream, ci: true }).isEnabled).toBe(false);
+  });
+});
+
 describe('numeric option validation (F3)', () => {
   it('throws for invalid progressBarWidth', () => {
     expect(() => new Spinner({ progressBarWidth: -5 })).toThrow();

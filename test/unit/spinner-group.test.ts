@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { SpinnerGroup } from '../../src/spinner.js';
+import { SpinnerGroup, spinGroup } from '../../src/spinner.js';
 import { createMockStream, ANSI, stripAnsi } from '../helpers/mock-stream.js';
 
 describe('SpinnerGroup', () => {
@@ -440,6 +440,234 @@ describe('SpinnerGroup', () => {
       expect(stripAnsi(stream.output)).toContain('Done');
       group.succeed('keep');
       vi.useRealTimers();
+    });
+  });
+
+  describe('state getters', () => {
+    it('isSpinning reflects active entries', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: true });
+      expect(group.isSpinning).toBe(false);
+      group.add('a', 'A');
+      expect(group.isSpinning).toBe(true);
+      group.succeed('a');
+      expect(group.isSpinning).toBe(false);
+    });
+
+    it('keys returns insertion order', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: true });
+      group.add('a', 'A');
+      group.add('b', 'B');
+      expect(group.keys()).toEqual(['a', 'b']);
+    });
+
+    it('status returns per-key status or undefined', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: true });
+      group.add('a', 'A');
+      expect(group.status('a')).toBe('spinning');
+      group.fail('a');
+      expect(group.status('a')).toBe('failed');
+      expect(group.status('missing')).toBeUndefined();
+    });
+  });
+
+  describe('spinGroup() factory', () => {
+    it('returns a working SpinnerGroup', () => {
+      const stream = createMockStream();
+      const group = spinGroup({ stream, ci: true });
+      expect(group).toBeInstanceOf(SpinnerGroup);
+      group.add('a', 'Task');
+      expect(stream.output).toContain('Task');
+    });
+  });
+
+  describe('per-entry feature parity', () => {
+    it('renders per-entry prefix in CI mode', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: true });
+      group.add('a', 'Task', { prefix: '[1/3] ' });
+      // CI prints a static line: `<prefix>- <text>` (no suffix/progress/time).
+      expect(stripAnsi(stream.output)).toContain('[1/3] - Task');
+    });
+
+    it('renders per-entry prefix and suffix in TTY mode', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('a', 'Task', { prefix: '[1/3] ', suffix: '(wait)' });
+      vi.advanceTimersByTime(80);
+      expect(stripAnsi(stream.output)).toContain('[1/3] ');
+      expect(stripAnsi(stream.output)).toContain('Task (wait)');
+      group.succeed('a');
+      vi.useRealTimers();
+    });
+
+    it('applies per-entry color to the frame', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('a', 'Task', { color: 'red' });
+      vi.advanceTimersByTime(80);
+      expect(stream.output).toContain(ANSI.RED);
+      group.succeed('a');
+      vi.useRealTimers();
+    });
+
+    it('applies per-entry textColor', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('a', 'Task', { textColor: 'blue' });
+      vi.advanceTimersByTime(80);
+      expect(stream.output).toContain(ANSI.BLUE);
+      group.succeed('a');
+      vi.useRealTimers();
+    });
+
+    it('shows progress percent', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('a', 'Download');
+      group.progress('a', 50, 100);
+      vi.advanceTimersByTime(80);
+      expect(stripAnsi(stream.output)).toContain('50%');
+      group.succeed('a');
+      vi.useRealTimers();
+    });
+
+    it('shows progress bar', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('a', 'Download', { progressBar: true });
+      group.progress('a', 50, 100);
+      vi.advanceTimersByTime(80);
+      expect(stream.output).toContain('█');
+      expect(stream.output).toContain('░');
+      group.succeed('a');
+      vi.useRealTimers();
+    });
+
+    it('clamps out-of-range progress without NaN/crash', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('a', 'D', { progressBar: true });
+      group.add('b', 'E', { progressBar: true });
+      group.progress('a', 150, 100);
+      group.progress('b', 5, 0);
+      expect(() => vi.advanceTimersByTime(80)).not.toThrow();
+      const visible = stripAnsi(stream.output);
+      expect(visible).toContain('100%');
+      expect(visible).toContain('0%');
+      expect(visible).not.toContain('NaN');
+      group.succeed('a');
+      group.succeed('b');
+      vi.useRealTimers();
+    });
+
+    it('progress() is a no-op for unknown/finished keys and returns this', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: true });
+      expect(group.progress('missing', 1, 2)).toBe(group);
+      group.add('a', 'A');
+      group.succeed('a');
+      expect(group.progress('a', 1, 2)).toBe(group);
+    });
+
+    it('shows elapsed time and freezes it at finish', () => {
+      vi.useFakeTimers();
+      const base = 1_000_000;
+      vi.setSystemTime(base);
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('a', 'Work', { showTime: true });
+      group.add('keep', 'Other'); // keeps timer alive after 'a' finishes
+
+      vi.setSystemTime(base + 2000);
+      vi.advanceTimersByTime(80);
+      expect(stripAnsi(stream.output)).toMatch(/\dms|\d\.\ds/);
+
+      // Finish at +3000ms → frozen elapsed ~3.0s.
+      vi.setSystemTime(base + 3000);
+      group.succeed('a', 'Done');
+      // Advance well past finish; the frozen time must neither grow nor vanish.
+      vi.setSystemTime(base + 60000);
+      stream.clear();
+      vi.advanceTimersByTime(80);
+      const after = stripAnsi(stream.output);
+      expect(after).toContain('Done');
+      expect(after).toMatch(/\(3\.\ds\)/); // frozen at ~3s, baked into final line
+      expect(after).not.toMatch(/\d+m/); // would appear if time kept ticking
+      group.succeed('keep');
+      vi.useRealTimers();
+    });
+
+    it('truncates long lines to terminal width (one row per entry)', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream({ columns: 20 });
+      const group = new SpinnerGroup({ stream, ci: false });
+      const long = 'x'.repeat(100);
+      group.add('a', long);
+      vi.advanceTimersByTime(80);
+      // Every chunk this entry emits must fit; check the composed lines.
+      const lines = stripAnsi(stream.output).split('\n').filter(l => l.includes('x'));
+      for (const line of lines) {
+        expect(line.length).toBeLessThanOrEqual(20);
+      }
+      expect(stripAnsi(stream.output)).toContain('...');
+      group.succeed('a');
+      vi.useRealTimers();
+    });
+
+    it('truncate:false keeps full text', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream({ columns: 20 });
+      const group = new SpinnerGroup({ stream, ci: false });
+      const long = 'y'.repeat(50);
+      group.add('a', long, { truncate: false });
+      vi.advanceTimersByTime(80);
+      expect(stripAnsi(stream.output)).toContain(long);
+      group.succeed('a');
+      vi.useRealTimers();
+    });
+
+    it('truncation preserves prefix, suffix, and progress', () => {
+      vi.useFakeTimers();
+      const stream = createMockStream({ columns: 30 });
+      const group = new SpinnerGroup({ stream, ci: false });
+      group.add('a', 'x'.repeat(100), { prefix: 'P> ', suffix: '<S' });
+      group.progress('a', 25, 100);
+      vi.advanceTimersByTime(80);
+      const visible = stripAnsi(stream.output);
+      expect(visible).toContain('P> ');
+      expect(visible).toContain('<S');
+      expect(visible).toContain('25%');
+      group.succeed('a');
+      vi.useRealTimers();
+    });
+
+    it('sanitizes per-entry prefix/suffix', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: true });
+      group.add('a', 'Task', { prefix: '\x1B[2J', suffix: 'end\x07' });
+      expect(stream.output).not.toContain('\x07');
+      expect(stream.output).not.toContain('\x1B[2J');
+    });
+
+    it('throws for invalid per-entry progressBarWidth', () => {
+      const stream = createMockStream();
+      const group = new SpinnerGroup({ stream, ci: true });
+      expect(() => group.add('a', 'T', { progressBarWidth: -1 })).toThrow();
+    });
+
+    it('throws for invalid group-level progressBarWidth', () => {
+      const stream = createMockStream();
+      expect(() => new SpinnerGroup({ stream, progressBarWidth: 0 })).toThrow();
+      expect(() => new SpinnerGroup({ stream, progressBarWidth: 1.5 })).toThrow();
     });
   });
 });
