@@ -12,6 +12,34 @@ const CLEAR_LINE = '\r\x1B[K';
 const RESET = '\x1B[0m';
 
 /**
+ * Matches all C0 control characters (0x00–0x1F), DEL (0x7F), and the 8-bit CSI
+ * introducer (0x9B). This covers ESC (0x1B) — the lead byte of every ANSI
+ * escape / OSC sequence — as well as BEL (0x07), CR (0x0D), and backspace.
+ */
+const CONTROL_CHARS = /[\x00-\x1F\x7F\x9B]/g;
+
+/**
+ * Removes terminal control characters from a string so caller-supplied text
+ * cannot inject ANSI escape sequences (cursor movement, screen clears, `\r`
+ * line-spoofing, OSC hyperlink/window-title sequences) into the output stream.
+ *
+ * This strips **all** C0 controls, including newline (`\n`) and tab (`\t`),
+ * because the spinner is a single-line in-place renderer — embedded newlines
+ * would corrupt the animation. Printable text, emoji, and CJK are preserved.
+ *
+ * The spinner sanitizes all user-supplied strings with this automatically; it
+ * is exported so consumers can reuse the same policy on their own output.
+ *
+ * @param s - The untrusted string to sanitize.
+ * @returns The string with all control characters removed.
+ * @example
+ * stripControl('done\x1B[2J\x1B]0;evil\x07'); // => 'done0;evil'
+ */
+export function stripControl(s: string): string {
+  return s.replace(CONTROL_CHARS, '');
+}
+
+/**
  * Something that holds a live timer / hidden cursor and must be cleaned up if
  * the process is interrupted or exits. Implemented by Spinner and SpinnerGroup.
  * @internal
@@ -328,24 +356,32 @@ export class Spinner implements Cleanable {
       throw new Error('Spinner: `frames` must contain at least one frame');
     }
     this.interval = options.interval ?? 80;
-    this.text = options.text ?? '';
+    if (!Number.isFinite(this.interval) || this.interval < 1) {
+      throw new Error('Spinner: `interval` must be a number >= 1');
+    }
+    // Sanitize all caller-supplied display strings so they cannot inject
+    // terminal escape sequences into the output stream.
+    this.text = stripControl(options.text ?? '');
     this.color = options.color;
     this.textColor = options.textColor;
     // CI mode: explicit option, or auto-detect from CI env vars or non-TTY
     this.ciMode = options.ci ?? (isCI() || !isTTY(this.stream));
     this.showTime = options.showTime ?? false;
-    this.prefix = options.prefix ?? '';
-    this.suffix = options.suffix ?? '';
+    this.prefix = stripControl(options.prefix ?? '');
+    this.suffix = stripControl(options.suffix ?? '');
     this.symbols = {
-      succeed: options.symbols?.succeed ?? '✔',
-      fail: options.symbols?.fail ?? '✖',
-      warn: options.symbols?.warn ?? '⚠',
-      info: options.symbols?.info ?? 'ℹ',
+      succeed: stripControl(options.symbols?.succeed ?? '✔'),
+      fail: stripControl(options.symbols?.fail ?? '✖'),
+      warn: stripControl(options.symbols?.warn ?? '⚠'),
+      info: stripControl(options.symbols?.info ?? 'ℹ'),
     };
     this.persist = options.persist ?? false;
     this.shouldHideCursor = options.hideCursor ?? true;
     this.progressBar = options.progressBar ?? false;
     this.progressBarWidth = options.progressBarWidth ?? 20;
+    if (!Number.isInteger(this.progressBarWidth) || this.progressBarWidth < 1) {
+      throw new Error('Spinner: `progressBarWidth` must be a positive integer');
+    }
     this.truncate = options.truncate ?? false;
     this.currentFrame = 0;
     this._isSpinning = false;
@@ -489,7 +525,7 @@ export class Spinner implements Cleanable {
   start(text?: string): this {
     if (this._isSpinning) return this;
 
-    if (text) this.text = text;
+    if (text) this.text = stripControl(text);
     this._isSpinning = true;
     this.currentFrame = 0;
     this.startTime = Date.now();
@@ -524,6 +560,16 @@ export class Spinner implements Cleanable {
    * spinner.stop('Completed');
    */
   stop(finalText?: string): this {
+    return this._finalize(finalText === undefined ? undefined : stripControl(finalText));
+  }
+
+  /**
+   * Internal stop that writes `finalText` verbatim. Callers must pass a string
+   * that is already safe — either sanitized user input or text composed by the
+   * library itself (which contains the library's own ANSI color codes and must
+   * NOT be re-stripped).
+   */
+  private _finalize(finalText?: string): this {
     if (!this._isSpinning) return this;
 
     const timeText = this._getElapsedText();
@@ -605,7 +651,7 @@ export class Spinner implements Cleanable {
    * spinner.update('Still loading...');
    */
   update(text: string): this {
-    this.text = text;
+    this.text = stripControl(text);
     return this;
   }
 
@@ -627,23 +673,29 @@ export class Spinner implements Cleanable {
   /**
    * Prints a log message while the spinner is running.
    * The message appears above the spinner line.
+   *
+   * The message is sanitized with {@link stripControl}: all control characters
+   * (including `\n` and `\t`) are removed, so a multi-line message is collapsed
+   * to a single line. This prevents untrusted input from injecting terminal
+   * escape sequences.
    * @param message - Message to print.
    * @returns The spinner instance for chaining.
    * @example
    * spinner.log('Processing file 1 of 10');
    */
   log(message: string): this {
+    const safe = stripControl(message);
     if (this.ciMode) {
-      this.stream.write(message + '\n');
+      this.stream.write(safe + '\n');
       return this;
     }
 
     if (this._isSpinning) {
       // Clear spinner line, print message, re-render spinner
-      this.stream.write(CLEAR_LINE + message + '\n');
+      this.stream.write(CLEAR_LINE + safe + '\n');
       this._render();
     } else {
-      this.stream.write(message + '\n');
+      this.stream.write(safe + '\n');
     }
     return this;
   }
@@ -657,7 +709,7 @@ export class Spinner implements Cleanable {
    */
   succeed(text?: string): this {
     const symbol = this._colorize(this.symbols.succeed, 'green');
-    return this.stop(`${symbol} ${text ?? (this.text || 'Done')}`);
+    return this._finalize(`${symbol} ${stripControl(text ?? (this.text || 'Done'))}`);
   }
 
   /**
@@ -669,7 +721,7 @@ export class Spinner implements Cleanable {
    */
   fail(text?: string): this {
     const symbol = this._colorize(this.symbols.fail, 'red');
-    return this.stop(`${symbol} ${text ?? (this.text || 'Failed')}`);
+    return this._finalize(`${symbol} ${stripControl(text ?? (this.text || 'Failed'))}`);
   }
 
   /**
@@ -681,7 +733,7 @@ export class Spinner implements Cleanable {
    */
   warn(text?: string): this {
     const symbol = this._colorize(this.symbols.warn, 'yellow');
-    return this.stop(`${symbol} ${text ?? (this.text || 'Warning')}`);
+    return this._finalize(`${symbol} ${stripControl(text ?? (this.text || 'Warning'))}`);
   }
 
   /**
@@ -693,7 +745,7 @@ export class Spinner implements Cleanable {
    */
   info(text?: string): this {
     const symbol = this._colorize(this.symbols.info, 'blue');
-    return this.stop(`${symbol} ${text ?? (this.text || 'Info')}`);
+    return this._finalize(`${symbol} ${stripControl(text ?? (this.text || 'Info'))}`);
   }
 
   /**
@@ -812,10 +864,10 @@ export class SpinnerGroup implements Cleanable {
     this.stream = options.stream ?? process.stderr;
     this.ciMode = options.ci ?? (isCI() || !isTTY(this.stream));
     this.symbols = {
-      succeed: options.symbols?.succeed ?? '✔',
-      fail: options.symbols?.fail ?? '✖',
-      warn: options.symbols?.warn ?? '⚠',
-      info: options.symbols?.info ?? 'ℹ',
+      succeed: stripControl(options.symbols?.succeed ?? '✔'),
+      fail: stripControl(options.symbols?.fail ?? '✖'),
+      warn: stripControl(options.symbols?.warn ?? '⚠'),
+      info: stripControl(options.symbols?.info ?? 'ℹ'),
     };
     this.shouldHideCursor = options.hideCursor ?? true;
   }
@@ -901,6 +953,7 @@ export class SpinnerGroup implements Cleanable {
   add(key: string, text: string): this {
     if (this.spinners.has(key)) return this;
 
+    text = stripControl(text);
     this.spinners.set(key, { text, status: 'spinning' });
     this.order.push(key);
 
@@ -927,21 +980,26 @@ export class SpinnerGroup implements Cleanable {
   update(key: string, text: string): this {
     const state = this.spinners.get(key);
     if (state && state.status === 'spinning') {
-      state.text = text;
+      state.text = stripControl(text);
     }
     return this;
   }
 
   /**
    * Prints a log message above the spinner group.
+   *
+   * The message is sanitized with {@link stripControl} (control characters,
+   * including `\n` and `\t`, are removed), so a multi-line message collapses to
+   * a single line.
    * @param message - Message to print.
    * @returns The group instance for chaining.
    * @example
    * group.log('Starting batch process');
    */
   log(message: string): this {
+    const safe = stripControl(message);
     if (this.ciMode) {
-      this.stream.write(message + '\n');
+      this.stream.write(safe + '\n');
       return this;
     }
 
@@ -949,11 +1007,11 @@ export class SpinnerGroup implements Cleanable {
     if (spinning && this.order.length > 0) {
       // Move up to first line, insert message, move back down
       this.stream.write(MOVE_UP(this.order.length));
-      this.stream.write(CLEAR_LINE + message + '\n');
+      this.stream.write(CLEAR_LINE + safe + '\n');
       // Re-render all spinners below
       this._renderAll();
     } else {
-      this.stream.write(message + '\n');
+      this.stream.write(safe + '\n');
     }
     return this;
   }
@@ -1029,7 +1087,8 @@ export class SpinnerGroup implements Cleanable {
     if (!state || state.status !== 'spinning') return this;
 
     state.status = status;
-    const displayText = text ?? state.text;
+    // `text` is caller-supplied; `state.text` was sanitized on add/update.
+    const displayText = text !== undefined ? stripControl(text) : state.text;
     if (symbol) {
       const coloredSymbol = this._colorize(symbol, color);
       state.finalText = `${coloredSymbol} ${displayText}`;

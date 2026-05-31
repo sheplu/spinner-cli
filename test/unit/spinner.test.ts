@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { Spinner, ASCII_FRAMES, BRAILLE_FRAMES } from '../../src/spinner.js';
+import { Spinner, ASCII_FRAMES, BRAILLE_FRAMES, stripControl } from '../../src/spinner.js';
 import { createMockStream, ANSI, stripAnsi } from '../helpers/mock-stream.js';
 
 describe('Spinner', () => {
@@ -814,5 +814,128 @@ describe('Spinner', () => {
       spinner.stop();
       vi.useRealTimers();
     });
+  });
+});
+
+describe('stripControl()', () => {
+  it('removes ESC, BEL, CR, and other C0 controls but keeps printable text', () => {
+    expect(stripControl('done\x1B[2J\x1B]0;evil\x07')).toBe('done[2J]0;evil');
+    expect(stripControl('a\rFAKE')).toBe('aFAKE');
+    expect(stripControl('tab\there\nnewline')).toBe('tabherenewline');
+    expect(stripControl('\x9Bcsi')).toBe('csi');
+  });
+
+  it('leaves emoji and CJK intact', () => {
+    expect(stripControl('🚀 进度 done')).toBe('🚀 进度 done');
+  });
+});
+
+describe('escape injection hardening (F1)', () => {
+  // Includes a BEL (0x07) and an OSC introducer (ESC ]) — neither is ever
+  // emitted by the library itself, so their absence proves sanitization ran
+  // without colliding with the library's own SGR / cursor codes.
+  const EVIL = '\x1B[2Jboom\x1B]0;pwned\x07\r\x1B[1A';
+
+  function assertClean(output: string): void {
+    expect(output).not.toContain('\x07'); // BEL — library never emits this
+    expect(output).not.toContain('\x1B]'); // OSC — library never emits this
+    expect(output).not.toContain('\x1B[2J'); // screen clear — never emitted
+  }
+
+  it('sanitizes constructor text/prefix/suffix', () => {
+    const stream = createMockStream();
+    const spinner = new Spinner({
+      stream,
+      ci: true,
+      text: EVIL,
+      prefix: '\x1B[31m',
+      suffix: 'end\x07',
+    });
+    spinner.start();
+    assertClean(stream.output);
+    expect(stream.output).toContain('boom'); // printable remainder survives
+    spinner.stop();
+  });
+
+  it('sanitizes start() and update() text', () => {
+    vi.useFakeTimers();
+    const stream = createMockStream();
+    const spinner = new Spinner({ stream, ci: false });
+    spinner.start(EVIL);
+    spinner.update(EVIL);
+    vi.advanceTimersByTime(80);
+    assertClean(stream.output);
+    spinner.stop();
+    vi.useRealTimers();
+  });
+
+  it('sanitizes log() messages', () => {
+    const stream = createMockStream();
+    const spinner = new Spinner({ stream, ci: true });
+    spinner.start();
+    spinner.log(EVIL);
+    assertClean(stream.output);
+    expect(stream.output).toContain('boom');
+    spinner.stop();
+  });
+
+  it('sanitizes stop() final text', () => {
+    const stream = createMockStream();
+    const spinner = new Spinner({ stream, ci: true });
+    spinner.start();
+    spinner.stop(EVIL);
+    assertClean(stream.output);
+  });
+
+  it('sanitizes status method text (succeed/fail)', () => {
+    const stream = createMockStream();
+    const spinner = new Spinner({ stream, ci: true });
+    spinner.start();
+    spinner.succeed(EVIL);
+    assertClean(stream.output);
+    expect(stream.output).toContain('boom');
+  });
+
+  it('sanitizes custom symbols', () => {
+    const stream = createMockStream();
+    const spinner = new Spinner({
+      stream,
+      ci: true,
+      symbols: { succeed: '\x1B[2J✓' },
+    });
+    spinner.start();
+    spinner.succeed('ok');
+    assertClean(stream.output);
+  });
+
+  it('does NOT strip the library\'s own colors (regression)', () => {
+    const stream = createMockStream();
+    const spinner = new Spinner({ stream, ci: false, color: 'cyan' });
+    spinner.start('Loading');
+    // succeed composes a green-colored symbol via the library itself
+    spinner.succeed('Done');
+    expect(stream.output).toContain(ANSI.GREEN);
+    expect(stream.output).toContain('✔');
+    expect(stream.output).toContain('Done');
+  });
+});
+
+describe('numeric option validation (F3)', () => {
+  it('throws for invalid progressBarWidth', () => {
+    expect(() => new Spinner({ progressBarWidth: -5 })).toThrow();
+    expect(() => new Spinner({ progressBarWidth: 0 })).toThrow();
+    expect(() => new Spinner({ progressBarWidth: 1.5 })).toThrow();
+    expect(() => new Spinner({ progressBarWidth: NaN })).toThrow();
+  });
+
+  it('throws for invalid interval', () => {
+    expect(() => new Spinner({ interval: 0 })).toThrow();
+    expect(() => new Spinner({ interval: -1 })).toThrow();
+    expect(() => new Spinner({ interval: NaN })).toThrow();
+  });
+
+  it('accepts valid numeric options', () => {
+    expect(() => new Spinner({ progressBarWidth: 20, interval: 80 })).not.toThrow();
+    expect(() => new Spinner({ progressBarWidth: 1, interval: 1 })).not.toThrow();
   });
 });
